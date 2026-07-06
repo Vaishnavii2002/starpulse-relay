@@ -158,6 +158,24 @@ async def warm_cache():
         logger.error("Cache warmup failed: %s", e)
 
 
+async def _keep_alive():
+    """Self-ping every 14 min to prevent Render free tier from sleeping."""
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "")
+    if not render_url:
+        return
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await _get_tts_client().get(f"{render_url}/health")
+            logger.info("Keep-alive ping sent")
+        except Exception:
+            pass
+        await asyncio.sleep(840)
+
+@app.on_event("startup")
+async def start_keep_alive():
+    asyncio.create_task(_keep_alive())
+
 @app.on_event("shutdown")
 async def cleanup():
     if _tts_client:

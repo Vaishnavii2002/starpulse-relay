@@ -374,6 +374,7 @@ async def voice_agent(ws: WebSocket):
     last_stt_activity = time.time()
     last_speech_detected = time.time()
     first_audio_ts: Optional[float] = None
+    greeting_done = False
     STT_WATCHDOG_TIMEOUT = 8.0
 
     try:
@@ -456,9 +457,16 @@ async def voice_agent(ws: WebSocket):
                     await send_audio(ws, stream_sid, _greeting_audio_cache, mark="greeting")
                     logger.info("Greeting sent")
 
+            elif event == "mark":
+                mark_name = msg.get("mark", {}).get("name", "")
+                if mark_name == "greeting":
+                    greeting_done = True
+                    last_speech_detected = time.time()
+                    logger.info("Greeting playback finished — STT now active")
+
             elif event == "media":
                 payload = msg.get("media", {}).get("payload", "")
-                if payload and dg_ws:
+                if payload and dg_ws and greeting_done:
                     if first_audio_ts is None:
                         first_audio_ts = time.time()
 

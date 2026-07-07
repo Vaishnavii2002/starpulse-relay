@@ -2,15 +2,6 @@
 StarPulse Voice Relay Server
 Twilio Media Streams + Deepgram STT/TTS + Claude AI (streaming).
 
-Optimizations:
-  - Claude 3.5 Haiku + prompt caching for faster TTFT
-  - Persistent httpx client for TTS (no TCP+TLS overhead per call)
-  - Pipelined REST TTS: Claude keeps generating while earlier chunks synthesize
-  - Fast first-chunk trigger (~18 chars / first clause boundary)
-  - Auto-hangup via Twilio REST API on terminal responses
-
-Run locally:  uvicorn server:app --host 0.0.0.0 --port 8080
-Expose:       ngrok http 8080
 """
 import asyncio
 import base64
@@ -373,9 +364,10 @@ async def voice_agent(ws: WebSocket):
     transcript_queue: asyncio.Queue[str] = asyncio.Queue()
     greeting_done = False
 
-    try:
-        dg_ws = await _connect_deepgram_stt()
+    dg_task = None
+    keepalive_task = None
 
+    try:
         async def read_deepgram():
             try:
                 async for msg in dg_ws:
@@ -394,8 +386,6 @@ async def voice_agent(ws: WebSocket):
             except Exception as e:
                 logger.error("Deepgram read error: %s", e)
 
-        dg_task = asyncio.create_task(read_deepgram())
-
         async def keepalive_deepgram():
             """Send KeepAlive every 5s so Deepgram never closes the idle connection."""
             while True:
@@ -405,7 +395,21 @@ async def voice_agent(ws: WebSocket):
                 except Exception:
                     pass
 
-        keepalive_task = asyncio.create_task(keepalive_deepgram())
+        async def start_stt():
+            """Connect Deepgram fresh and start reader + keepalive tasks."""
+            nonlocal dg_ws, dg_task, keepalive_task
+            if dg_task:
+                dg_task.cancel()
+            if keepalive_task:
+                keepalive_task.cancel()
+            if dg_ws:
+                try:
+                    await dg_ws.close()
+                except Exception:
+                    pass
+            dg_ws = await _connect_deepgram_stt()
+            dg_task = asyncio.create_task(read_deepgram())
+            keepalive_task = asyncio.create_task(keepalive_deepgram())
 
         async def process_transcripts():
             nonlocal conversation
@@ -463,8 +467,11 @@ async def voice_agent(ws: WebSocket):
             elif event == "mark":
                 mark_name = msg.get("mark", {}).get("name", "")
                 if mark_name == "greeting":
+                    # Connect Deepgram FRESH right when the greeting ends — a stale
+                    # connection that sat through the greeting won't transcribe reliably.
+                    await start_stt()
                     greeting_done = True
-                    logger.info("Greeting playback finished — STT now active")
+                    logger.info("Greeting playback finished — STT connected fresh, now active")
 
             elif event == "media":
                 payload = msg.get("media", {}).get("payload", "")
@@ -472,23 +479,13 @@ async def voice_agent(ws: WebSocket):
                     # Reconnect only on a REAL failure (dead reader task or send error)
                     if dg_task.done():
                         logger.warning("STT reader task died, reconnecting")
-                        try:
-                            await dg_ws.close()
-                        except Exception:
-                            pass
-                        dg_ws = await _connect_deepgram_stt()
-                        dg_task = asyncio.create_task(read_deepgram())
+                        await start_stt()
 
                     try:
                         await dg_ws.send(base64.b64decode(payload))
                     except (websockets.exceptions.ConnectionClosed, Exception) as e:
                         logger.warning("STT socket dead, reconnecting: %s", e)
-                        try:
-                            await dg_ws.close()
-                        except Exception:
-                            pass
-                        dg_ws = await _connect_deepgram_stt()
-                        dg_task = asyncio.create_task(read_deepgram())
+                        await start_stt()
                         await dg_ws.send(base64.b64decode(payload))
 
             elif event == "stop":

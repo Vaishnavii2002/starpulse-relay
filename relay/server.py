@@ -369,18 +369,34 @@ async def voice_agent(ws: WebSocket):
 
     try:
         async def read_deepgram():
+            # Buffer finalized segments; flush on speech_final OR UtteranceEnd,
+            # whichever comes first, so a query is never dropped waiting for a pause.
+            buffer_parts: list[str] = []
+
+            async def flush(reason: str):
+                if buffer_parts:
+                    text = " ".join(buffer_parts).strip()
+                    buffer_parts.clear()
+                    if text:
+                        logger.info("STT final (%s): %s", reason, text)
+                        await transcript_queue.put(text)
+
             try:
                 async for msg in dg_ws:
                     data = json.loads(msg)
-                    if data.get("type") == "Results":
+                    msg_type = data.get("type")
+                    if msg_type == "Results":
                         channel = data.get("channel", {})
                         alts = channel.get("alternatives", [{}])
-                        transcript = alts[0].get("transcript", "")
+                        transcript = alts[0].get("transcript", "").strip()
                         is_final = data.get("is_final", False)
                         speech_final = data.get("speech_final", False)
-                        if transcript.strip() and is_final and speech_final:
-                            logger.info("STT final: %s", transcript.strip())
-                            await transcript_queue.put(transcript.strip())
+                        if transcript and is_final:
+                            buffer_parts.append(transcript)
+                        if speech_final:
+                            await flush("speech_final")
+                    elif msg_type == "UtteranceEnd":
+                        await flush("utterance_end")
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("Deepgram STT connection closed")
             except Exception as e:

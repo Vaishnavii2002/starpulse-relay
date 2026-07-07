@@ -371,20 +371,14 @@ async def voice_agent(ws: WebSocket):
     conversation: list[dict] = []
     dg_ws = None
     transcript_queue: asyncio.Queue[str] = asyncio.Queue()
-    last_stt_activity = time.time()
-    last_speech_detected = time.time()
-    first_audio_ts: Optional[float] = None
     greeting_done = False
-    STT_WATCHDOG_TIMEOUT = 8.0
 
     try:
         dg_ws = await _connect_deepgram_stt()
 
         async def read_deepgram():
-            nonlocal last_stt_activity, last_speech_detected
             try:
                 async for msg in dg_ws:
-                    last_stt_activity = time.time()
                     data = json.loads(msg)
                     if data.get("type") == "Results":
                         channel = data.get("channel", {})
@@ -392,8 +386,6 @@ async def voice_agent(ws: WebSocket):
                         transcript = alts[0].get("transcript", "")
                         is_final = data.get("is_final", False)
                         speech_final = data.get("speech_final", False)
-                        if transcript.strip():
-                            last_speech_detected = time.time()
                         if transcript.strip() and is_final and speech_final:
                             logger.info("STT final: %s", transcript.strip())
                             await transcript_queue.put(transcript.strip())
@@ -403,6 +395,17 @@ async def voice_agent(ws: WebSocket):
                 logger.error("Deepgram read error: %s", e)
 
         dg_task = asyncio.create_task(read_deepgram())
+
+        async def keepalive_deepgram():
+            """Send KeepAlive every 5s so Deepgram never closes the idle connection."""
+            while True:
+                await asyncio.sleep(5)
+                try:
+                    await dg_ws.send(json.dumps({"type": "KeepAlive"}))
+                except Exception:
+                    pass
+
+        keepalive_task = asyncio.create_task(keepalive_deepgram())
 
         async def process_transcripts():
             nonlocal conversation
@@ -461,32 +464,19 @@ async def voice_agent(ws: WebSocket):
                 mark_name = msg.get("mark", {}).get("name", "")
                 if mark_name == "greeting":
                     greeting_done = True
-                    last_speech_detected = time.time()
                     logger.info("Greeting playback finished — STT now active")
 
             elif event == "media":
                 payload = msg.get("media", {}).get("payload", "")
                 if payload and dg_ws and greeting_done:
-                    if first_audio_ts is None:
-                        first_audio_ts = time.time()
-
-                    needs_reconnect = False
+                    # Reconnect only on a REAL failure (dead reader task or send error)
                     if dg_task.done():
                         logger.warning("STT reader task died, reconnecting")
-                        needs_reconnect = True
-                    elif time.time() - last_speech_detected > STT_WATCHDOG_TIMEOUT and first_audio_ts and time.time() - first_audio_ts > STT_WATCHDOG_TIMEOUT:
-                        logger.warning("STT watchdog: no speech for %.1fs, reconnecting", time.time() - last_speech_detected)
-                        needs_reconnect = True
-
-                    if needs_reconnect:
                         try:
                             await dg_ws.close()
                         except Exception:
                             pass
                         dg_ws = await _connect_deepgram_stt()
-                        last_stt_activity = time.time()
-                        last_speech_detected = time.time()
-                        first_audio_ts = time.time()
                         dg_task = asyncio.create_task(read_deepgram())
 
                     try:
@@ -498,9 +488,6 @@ async def voice_agent(ws: WebSocket):
                         except Exception:
                             pass
                         dg_ws = await _connect_deepgram_stt()
-                        last_stt_activity = time.time()
-                        last_speech_detected = time.time()
-                        first_audio_ts = time.time()
                         dg_task = asyncio.create_task(read_deepgram())
                         await dg_ws.send(base64.b64decode(payload))
 
@@ -514,6 +501,10 @@ async def voice_agent(ws: WebSocket):
         logger.error("Relay error: %s", call_sid, exc_info=True)
     finally:
         await transcript_queue.put(None)
+        try:
+            keepalive_task.cancel()
+        except Exception:
+            pass
         if dg_ws:
             try:
                 await dg_ws.close()

@@ -243,10 +243,12 @@ async def _run_sql(statement: str) -> bool:
         logger.warning("Databricks SQL not configured — skipping audit write")
         return False
     try:
+        # Own timeout > wait_timeout so a cold warehouse spin-up (15-30s) survives.
         resp = await _get_tts_client().post(
             f"{DATABRICKS_HOST}/api/2.0/sql/statements",
             headers={"Authorization": f"Bearer {DATABRICKS_TOKEN}"},
             json={"warehouse_id": DATABRICKS_WAREHOUSE_ID, "statement": statement, "wait_timeout": "30s"},
+            timeout=35.0,
         )
         if resp.status_code != 200:
             logger.error("SQL exec HTTP %d: %s", resp.status_code, resp.text[:200])
@@ -259,6 +261,9 @@ async def _run_sql(statement: str) -> bool:
             return True
         err = resp.json().get("status", {}).get("error", {}).get("message", "")
         logger.error("SQL exec failed (state=%s): %s", state, err)
+        return False
+    except httpx.TimeoutException:
+        logger.error("SQL exec timed out (warehouse slow/cold)")
         return False
     except Exception as e:
         logger.error("SQL exec failed: %s", e)

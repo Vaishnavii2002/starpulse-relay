@@ -235,10 +235,13 @@ def _sql_esc(s: str) -> str:
     return (s or "").replace("'", "''")
 
 
-async def _run_sql(statement: str):
-    """Execute a SQL statement on the Databricks warehouse via the REST API."""
+async def _run_sql(statement: str) -> bool:
+    """Execute a SQL statement on the Databricks warehouse via the REST API.
+    Returns True only if the statement actually succeeded (a failed statement
+    still returns HTTP 200 with state=FAILED, so we must inspect the body)."""
     if not (DATABRICKS_HOST and DATABRICKS_TOKEN and DATABRICKS_WAREHOUSE_ID):
-        return
+        logger.warning("Databricks SQL not configured — skipping audit write")
+        return False
     try:
         resp = await _get_tts_client().post(
             f"{DATABRICKS_HOST}/api/2.0/sql/statements",
@@ -247,8 +250,19 @@ async def _run_sql(statement: str):
         )
         if resp.status_code != 200:
             logger.error("SQL exec HTTP %d: %s", resp.status_code, resp.text[:200])
+            return False
+        state = resp.json().get("status", {}).get("state", "")
+        if state == "SUCCEEDED":
+            return True
+        if state in ("PENDING", "RUNNING"):  # accepted, still finishing on the warehouse
+            logger.info("SQL exec accepted (state=%s)", state)
+            return True
+        err = resp.json().get("status", {}).get("error", {}).get("message", "")
+        logger.error("SQL exec failed (state=%s): %s", state, err)
+        return False
     except Exception as e:
         logger.error("SQL exec failed: %s", e)
+        return False
 
 
 async def report_call(call_sid: str, event: str = "", detail: str = "",
@@ -271,16 +285,18 @@ async def report_call(call_sid: str, event: str = "", detail: str = "",
         ]
         if member_selection:
             sets.append(f"member_selection = '{_sql_esc(member_selection)}'")
-        await _run_sql(
+        ok = await _run_sql(
             f"UPDATE {OUTREACH_TABLE} SET {', '.join(sets)} "
             f"WHERE provider_sid = '{_sql_esc(call_sid)}'"
         )
+        logger.info("Audit event logged [%s]: %s (ok=%s)", call_sid, event or member_selection, ok)
 
     if summary:
-        await _run_sql(
+        ok = await _run_sql(
             f"UPDATE {OUTREACH_TABLE} SET call_summary = '{_sql_esc(summary)}', "
             f"updated_at = '{now}' WHERE provider_sid = '{_sql_esc(call_sid)}'"
         )
+        logger.info("Audit summary logged [%s] (ok=%s)", call_sid, ok)
 
 
 async def summarize_call(conversation: list[dict]) -> str:

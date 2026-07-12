@@ -304,6 +304,32 @@ async def report_call(call_sid: str, event: str = "", detail: str = "",
         logger.info("Audit summary logged [%s] (ok=%s)", call_sid, ok)
 
 
+async def save_ai_call(call_sid: str, trail: list[str], summary: str) -> bool:
+    """Write the full turn-by-turn interaction trail + summary in ONE UPDATE
+    (avoids per-turn writes that add latency and race on the same row).
+    Retries once so a cold-warehouse timeout doesn't lose the transcript."""
+    if not call_sid or not trail:
+        return False
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    trail_text = _sql_esc(" | ".join(trail))
+    sets = [
+        "status = 'ai-conversation'",
+        "member_selection = 'AI Agent'",
+        ("interaction_log = CASE WHEN interaction_log IS NULL OR interaction_log = '' "
+         f"THEN '{trail_text}' ELSE interaction_log || ' | ' || '{trail_text}' END"),
+        f"updated_at = '{now}'",
+    ]
+    if summary:
+        sets.append(f"call_summary = '{_sql_esc(summary)}'")
+    stmt = (f"UPDATE {OUTREACH_TABLE} SET {', '.join(sets)} "
+            f"WHERE provider_sid = '{_sql_esc(call_sid)}'")
+    for attempt in range(2):
+        if await _run_sql(stmt):
+            return True
+        logger.warning("save_ai_call retry %d for %s", attempt + 1, call_sid)
+    return False
+
+
 async def summarize_call(conversation: list[dict]) -> str:
     """Use a cheap Claude model to produce one short professional line about the call."""
     if not conversation:
@@ -468,6 +494,7 @@ async def voice_agent(ws: WebSocket):
     call_sid: Optional[str] = None
     stream_sid: Optional[str] = None
     conversation: list[dict] = []
+    trail: list[str] = []  # timestamped turn-by-turn log for the audit interaction_log
     dg_ws = None
     transcript_queue: asyncio.Queue[str] = asyncio.Queue()
     greeting_done = False
@@ -554,8 +581,10 @@ async def voice_agent(ws: WebSocket):
 
                 # ── STREAM CLAUDE → PIPELINED TTS → PLAY ──
                 conversation.append({"role": "user", "content": user_text})
+                trail.append(f"[{time.strftime('%H:%M:%S', time.gmtime())}] ai-conversation: Member: {user_text}")
                 ai_reply = await stream_claude_and_speak(ws, stream_sid, conversation)
                 conversation.append({"role": "assistant", "content": ai_reply})
+                trail.append(f"[{time.strftime('%H:%M:%S', time.gmtime())}] ai-conversation: AI: {ai_reply}")
 
                 total_ms = int((time.time() - t_eos) * 1000)
                 logger.info("Turn complete in %dms: %s", total_ms, ai_reply[:80])
@@ -632,17 +661,17 @@ async def voice_agent(ws: WebSocket):
                 logger.info("Deepgram closed")
             except Exception:
                 pass
-        # ── Generate + report the AI call summary to the backend audit log ──
+        # ── Write the full transcript trail + summary to the audit log (one write) ──
         # Only if the member actually spoke (more than just the greeting).
-        if call_sid and any(m.get("role") == "user" for m in conversation):
+        if call_sid and trail:
             try:
                 summary = await summarize_call(conversation)
                 if summary:
                     logger.info("Call summary [%s]: %s", call_sid, summary)
-                    await report_call(call_sid, event="ai-conversation",
-                                      member_selection="AI Agent", summary=summary)
+                ok = await save_ai_call(call_sid, trail, summary)
+                logger.info("AI call saved [%s] (turns=%d, ok=%s)", call_sid, len(trail), ok)
             except Exception as e:
-                logger.error("Summary/report failed for %s: %s", call_sid, e)
+                logger.error("Save AI call failed for %s: %s", call_sid, e)
 
 
 # ── Twilio DTMF Webhooks ──

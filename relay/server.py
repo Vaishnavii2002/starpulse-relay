@@ -34,8 +34,12 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5")
 SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "claude-haiku-4-5")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
-# Databricks backend base URL so the relay can report call events + summaries
-BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
+# Databricks SQL warehouse — the relay writes call events + summaries straight to
+# the audit table (the Databricks App itself is OAuth-walled, so HTTP POST won't work).
+DATABRICKS_HOST = os.getenv("DATABRICKS_HOST", "").rstrip("/")
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN", "")
+DATABRICKS_WAREHOUSE_ID = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
+OUTREACH_TABLE = os.getenv("OUTREACH_TABLE", "medicare_stars.silver.outreach_activity_log")
 
 SYSTEM_PROMPT = (
     "You are a friendly and professional Medicare care coordinator for StarPulse. "
@@ -226,25 +230,57 @@ async def _hangup_call(call_sid: str):
         logger.error("Hangup failed for %s: %s", call_sid, e)
 
 
-# ── Report call events + summary back to the Databricks backend ──
-async def report_call(call_sid: str, event: str = "", detail: str = "",
-                      member_selection: str = "", summary: str = ""):
-    """POST an in-call event and/or final summary to the backend audit log."""
-    if not BACKEND_URL or not call_sid:
+# ── Report call events + summary straight into the Databricks audit table ──
+def _sql_esc(s: str) -> str:
+    return (s or "").replace("'", "''")
+
+
+async def _run_sql(statement: str):
+    """Execute a SQL statement on the Databricks warehouse via the REST API."""
+    if not (DATABRICKS_HOST and DATABRICKS_TOKEN and DATABRICKS_WAREHOUSE_ID):
         return
     try:
-        await _get_tts_client().post(
-            f"{BACKEND_URL}/api/outreach/call-report",
-            json={
-                "call_sid": call_sid,
-                "event": event,
-                "detail": detail,
-                "member_selection": member_selection,
-                "summary": summary,
-            },
+        resp = await _get_tts_client().post(
+            f"{DATABRICKS_HOST}/api/2.0/sql/statements",
+            headers={"Authorization": f"Bearer {DATABRICKS_TOKEN}"},
+            json={"warehouse_id": DATABRICKS_WAREHOUSE_ID, "statement": statement, "wait_timeout": "30s"},
         )
+        if resp.status_code != 200:
+            logger.error("SQL exec HTTP %d: %s", resp.status_code, resp.text[:200])
     except Exception as e:
-        logger.error("report_call failed for %s: %s", call_sid, e)
+        logger.error("SQL exec failed: %s", e)
+
+
+async def report_call(call_sid: str, event: str = "", detail: str = "",
+                      member_selection: str = "", summary: str = ""):
+    """Write an in-call event and/or final summary to the outreach audit table."""
+    if not call_sid:
+        return
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+    ts = time.strftime("%H:%M:%S", time.gmtime())
+
+    if event or member_selection:
+        entry = f"[{ts}] {_sql_esc(event or 'in-progress')}"
+        if detail:
+            entry += f": {_sql_esc(detail)}"
+        sets = [
+            f"status = '{_sql_esc(event or 'in-progress')}'",
+            ("interaction_log = CASE WHEN interaction_log IS NULL OR interaction_log = '' "
+             f"THEN '{entry}' ELSE interaction_log || ' | ' || '{entry}' END"),
+            f"updated_at = '{now}'",
+        ]
+        if member_selection:
+            sets.append(f"member_selection = '{_sql_esc(member_selection)}'")
+        await _run_sql(
+            f"UPDATE {OUTREACH_TABLE} SET {', '.join(sets)} "
+            f"WHERE provider_sid = '{_sql_esc(call_sid)}'"
+        )
+
+    if summary:
+        await _run_sql(
+            f"UPDATE {OUTREACH_TABLE} SET call_summary = '{_sql_esc(summary)}', "
+            f"updated_at = '{now}' WHERE provider_sid = '{_sql_esc(call_sid)}'"
+        )
 
 
 async def summarize_call(conversation: list[dict]) -> str:

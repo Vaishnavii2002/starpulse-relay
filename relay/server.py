@@ -30,8 +30,12 @@ app = FastAPI(title="StarPulse Voice Relay")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5")
+# Cheaper/lighter model just for the short post-call summary
+SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "claude-haiku-4-5")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+# Databricks backend base URL so the relay can report call events + summaries
+BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
 
 SYSTEM_PROMPT = (
     "You are a friendly and professional Medicare care coordinator for StarPulse. "
@@ -57,8 +61,7 @@ GREETING = "Hi, I'm your StarPulse care coordinator. How can I help you today?"
 _SENTENCE_END = re.compile(r'[.!?]\s*$')
 
 TERMINAL_PHRASES = {
-    "you're welcome", "have a great day", "take care", "goodbye",
-    "all set", "see you", "thanks for calling", "have a nice day",
+    "you're welcome", "have a great day", "take care", "goodbye", "see you", "thanks for calling", "have a nice day",
 }
 
 # ── Context-aware fillers ──
@@ -221,6 +224,54 @@ async def _hangup_call(call_sid: str):
         logger.info("Hangup call %s: status=%d", call_sid, resp.status_code)
     except Exception as e:
         logger.error("Hangup failed for %s: %s", call_sid, e)
+
+
+# ── Report call events + summary back to the Databricks backend ──
+async def report_call(call_sid: str, event: str = "", detail: str = "",
+                      member_selection: str = "", summary: str = ""):
+    """POST an in-call event and/or final summary to the backend audit log."""
+    if not BACKEND_URL or not call_sid:
+        return
+    try:
+        await _get_tts_client().post(
+            f"{BACKEND_URL}/api/outreach/call-report",
+            json={
+                "call_sid": call_sid,
+                "event": event,
+                "detail": detail,
+                "member_selection": member_selection,
+                "summary": summary,
+            },
+        )
+    except Exception as e:
+        logger.error("report_call failed for %s: %s", call_sid, e)
+
+
+async def summarize_call(conversation: list[dict]) -> str:
+    """Use a cheap Claude model to produce one short professional line about the call."""
+    if not conversation:
+        return ""
+    transcript = "\n".join(
+        f"{'Member' if m['role'] == 'user' else 'Agent'}: {m['content']}"
+        for m in conversation if isinstance(m.get("content"), str)
+    )
+    prompt = (
+        "Summarize this healthcare outreach call in ONE short, professional sentence "
+        "for an internal audit log. State the outcome clearly: was an appointment "
+        "scheduled and for when, did the member ask questions, or was there no action? "
+        "Be concise (max 20 words). Do not add quotes.\n\n"
+        f"{transcript}\n\nSummary:"
+    )
+    try:
+        resp = await _get_claude().messages.create(
+            model=SUMMARY_MODEL,
+            max_tokens=60,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        logger.error("summarize_call failed: %s", e)
+        return ""
 
 
 # ── Streaming Claude → pipelined REST TTS → Twilio ──
@@ -524,6 +575,17 @@ async def voice_agent(ws: WebSocket):
                 logger.info("Deepgram closed")
             except Exception:
                 pass
+        # ── Generate + report the AI call summary to the backend audit log ──
+        # Only if the member actually spoke (more than just the greeting).
+        if call_sid and any(m.get("role") == "user" for m in conversation):
+            try:
+                summary = await summarize_call(conversation)
+                if summary:
+                    logger.info("Call summary [%s]: %s", call_sid, summary)
+                    await report_call(call_sid, event="ai-conversation",
+                                      member_selection="AI Agent", summary=summary)
+            except Exception as e:
+                logger.error("Summary/report failed for %s: %s", call_sid, e)
 
 
 # ── Twilio DTMF Webhooks ──
@@ -547,6 +609,8 @@ async def call_gather(request: Request):
     logger.info("call-gather: SID=%s Digits=%s", call_sid, digits)
 
     if digits == "1":
+        asyncio.create_task(report_call(call_sid, event="scheduling",
+                                        detail="Member pressed 1 — scheduling"))
         return _twiml(
             '<Response>'
             '<Gather numDigits="1" action="/call-slot" method="POST" timeout="10">'
@@ -569,6 +633,8 @@ async def call_gather(request: Request):
         )
 
     if digits == "2":
+        asyncio.create_task(report_call(call_sid, event="ai-conversation",
+                                        detail="Member pressed 2 — AI agent"))
         relay_host = os.getenv("RELAY_HOST", "localhost:8080")
         return _twiml(
             '<Response>'
@@ -579,6 +645,10 @@ async def call_gather(request: Request):
             '</Response>'
         )
 
+    asyncio.create_task(report_call(call_sid, event="no-action",
+                                    detail=f"Member pressed {digits or 'nothing'}",
+                                    member_selection="No action",
+                                    summary="No action taken by the member."))
     return _twiml(
         '<Response>'
         '<Say voice="Polly.Joanna-Neural">Thank you for your time. Goodbye.</Say>'
@@ -596,6 +666,10 @@ async def call_slot(request: Request):
     slot = _SLOT_MAP.get(digits, "callback requested")
 
     if digits == "4":
+        asyncio.create_task(report_call(
+            call_sid, event="callback-requested",
+            detail="Member pressed 4 — callback", member_selection="No action",
+            summary="Member requested a callback with more options."))
         return _twiml(
             '<Response>'
             '<Say voice="Polly.Joanna-Neural">Your callback request has been noted. '
@@ -604,6 +678,10 @@ async def call_slot(request: Request):
             '</Response>'
         )
 
+    asyncio.create_task(report_call(
+        call_sid, event="scheduled", detail=f"Slot selected: {slot}",
+        member_selection=f"Scheduled — {slot}",
+        summary=f"Appointment scheduled for {slot}."))
     return _twiml(
         '<Response>'
         '<Say voice="Polly.Joanna-Neural">'

@@ -5,6 +5,7 @@ Twilio Media Streams + Deepgram STT/TTS + Claude AI (streaming).
 """
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -100,6 +101,7 @@ def _pick_filler(user_text: str) -> Optional[str]:
 # ── Caches & persistent clients ──
 _greeting_audio_cache: bytes = b""
 _filler_audio_cache: dict[str, bytes] = {}
+_audio_store: dict[str, bytes] = {}  # id → janus MP3, served to Twilio <Play> for the intro/menu
 _claude_client: Optional[anthropic.AsyncAnthropic] = None
 _tts_client: Optional[httpx.AsyncClient] = None
 
@@ -136,6 +138,19 @@ async def deepgram_tts(text: str) -> bytes:
                 continue
             raise
     return b""
+
+
+# ── Deepgram TTS as MP3 (for Twilio <Play> — intro/menu in the janus voice) ──
+async def deepgram_tts_mp3(text: str) -> bytes:
+    resp = await _get_tts_client().post(
+        "https://api.deepgram.com/v1/speak",
+        params={"model": "aura-2-janus-en", "encoding": "mp3"},
+        headers={"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "application/json"},
+        json={"text": text},
+        timeout=15.0,
+    )
+    resp.raise_for_status()
+    return resp.content
 
 
 # ── Startup: pre-cache greeting audio ──
@@ -787,6 +802,36 @@ async def call_slot(request: Request):
         'You will receive an SMS confirmation shortly. Thank you and have a great day!</Say>'
         '</Response>'
     )
+
+
+# ── Janus intro/menu audio for Twilio <Play> ──
+@app.post("/prepare-audio")
+async def prepare_audio(request: Request):
+    """Generate (and cache) janus MP3 for a piece of text; return its play URL.
+    The backend calls this before placing a call so the audio is ready at pickup."""
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    if not text:
+        return {"error": "text required"}
+    audio_id = hashlib.md5(text.encode("utf-8")).hexdigest()
+    if audio_id not in _audio_store:
+        try:
+            _audio_store[audio_id] = await deepgram_tts_mp3(text)
+            logger.info("Prepared janus audio %s (%d bytes)", audio_id, len(_audio_store[audio_id]))
+        except Exception as e:
+            logger.error("prepare-audio failed: %s", e)
+            return {"error": "generation failed"}
+    host = os.getenv("RELAY_HOST", "localhost:8080")
+    return {"id": audio_id, "url": f"https://{host}/audio/{audio_id}"}
+
+
+@app.get("/audio/{audio_id}")
+def get_audio(audio_id: str):
+    """Serve a prepared janus MP3 to Twilio's <Play>."""
+    audio = _audio_store.get(audio_id)
+    if not audio:
+        return Response(status_code=404)
+    return Response(content=audio, media_type="audio/mpeg")
 
 
 @app.get("/health")

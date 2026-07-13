@@ -55,7 +55,7 @@ SYSTEM_PROMPT = (
     "Speak naturally and conversationally. "
     "Avoid lists or bullet points — use flowing sentences. Keep a warm, unhurried tone. "
     "IMPORTANT: Never start your response with filler phrases like 'sure thing, let me see.', "
-    "'Let me look into that', or 'One moment.'"
+    "'Let me look', or 'Happy to help!'"
     "jump directly into the substantive answer. The system already provides "
     "an acknowledgment phrase before your response plays."
 )
@@ -72,7 +72,7 @@ TERMINAL_PHRASES = {
 _FILLER_MAP = {
     "question": "sure thing, let me see.",
     "scheduling": "Let me look",
-    "default": "One moment.",
+    "default": "Happy to help!",
 }
 
 _SKIP_KEYWORDS = {
@@ -498,6 +498,7 @@ async def voice_agent(ws: WebSocket):
     dg_ws = None
     transcript_queue: asyncio.Queue[str] = asyncio.Queue()
     greeting_done = False
+    response_mark_event = asyncio.Event()  # set when Twilio finishes playing a response
 
     dg_task = None
     keepalive_task = None
@@ -590,9 +591,17 @@ async def voice_agent(ws: WebSocket):
                 logger.info("Turn complete in %dms: %s", total_ms, ai_reply[:80])
 
                 # ── AUTO-HANGUP on terminal response ──
+                # Wait until Twilio finishes PLAYING the goodbye (it echoes the
+                # "response" mark back when playback ends), so it never cuts off.
                 if _is_terminal(ai_reply):
-                    logger.info("🛑 Terminal response detected. Ending call in 5s...")
-                    await asyncio.sleep(5.0)
+                    logger.info("🛑 Terminal response detected. Waiting for playback to finish...")
+                    response_mark_event.clear()
+                    try:
+                        await asyncio.wait_for(response_mark_event.wait(), timeout=20.0)
+                        logger.info("Goodbye playback finished — hanging up")
+                    except asyncio.TimeoutError:
+                        logger.warning("Playback mark timeout — hanging up anyway")
+                    await asyncio.sleep(1.0)  # small tail buffer
                     await _hangup_call(call_sid)
                     break
 
@@ -625,6 +634,9 @@ async def voice_agent(ws: WebSocket):
                     await start_stt()
                     greeting_done = True
                     logger.info("Greeting playback finished — STT connected fresh, now active")
+                elif mark_name == "response":
+                    # Twilio finished playing a response — used to time the goodbye hangup.
+                    response_mark_event.set()
 
             elif event == "media":
                 payload = msg.get("media", {}).get("payload", "")

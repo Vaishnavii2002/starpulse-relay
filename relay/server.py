@@ -54,8 +54,8 @@ SYSTEM_PROMPT = (
     "End the conversation gracefully when the member is satisfied. "
     "Speak naturally and conversationally. "
     "Avoid lists or bullet points — use flowing sentences. Keep a warm, unhurried tone. "
-    "IMPORTANT: Never start your response with filler phrases like 'Sure thing', "
-    "'Absolutely', 'Of course', 'Great question', 'Let me help', or 'I would be happy to' — "
+    "IMPORTANT: Never start your response with filler phrases like 'sure thing, let me see.', "
+    "'Let me look into that', or 'One moment.'"
     "jump directly into the substantive answer. The system already provides "
     "an acknowledgment phrase before your response plays."
 )
@@ -71,7 +71,7 @@ TERMINAL_PHRASES = {
 # ── Context-aware fillers ──
 _FILLER_MAP = {
     "question": "sure thing, let me see.",
-    "scheduling": "Let me look into that.",
+    "scheduling": "Let me look",
     "default": "One moment.",
 }
 
@@ -124,7 +124,7 @@ async def deepgram_tts(text: str) -> bytes:
         try:
             resp = await _get_tts_client().post(
                 "https://api.deepgram.com/v1/speak",
-                params={"model": "aura-asteria-en", "encoding": "mulaw", "sample_rate": "8000", "container": "none"},
+                params={"model": "aura-2-janus-en", "encoding": "mulaw", "sample_rate": "8000", "container": "none"},
                 headers={"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "application/json"},
                 json={"text": text},
             )

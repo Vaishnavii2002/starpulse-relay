@@ -1,7 +1,18 @@
 """
 StarPulse Voice Relay Server
-Twilio Media Streams + Deepgram STT/TTS + Claude AI (streaming).
+================================
+Handles the live AI phone conversation that the Databricks app can't (no streaming).
 
+Pipeline per call:
+    Caller → Twilio Media Stream (WS) → Deepgram STT → Claude (streaming)
+          → Deepgram TTS (janus) → Twilio → Caller
+
+Also serves:
+  - DTMF menu webhooks (/call-gather, /call-slot) for the "press 1 to schedule" path
+  - Janus intro/menu audio (/prepare-audio, /audio/{id}) for Twilio <Play>
+  - Writes a turn-by-turn transcript + AI summary to the Databricks audit table
+
+Run:     uvicorn server:app --host 0.0.0.0 --port 8080
 """
 import asyncio
 import base64
@@ -9,7 +20,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import time
 from typing import Optional
 
@@ -63,8 +73,7 @@ SYSTEM_PROMPT = (
 
 GREETING = "Hi, I'm your StarPulse care coordinator. How can I help you today?"
 
-_SENTENCE_END = re.compile(r'[.!?]\s*$')
-
+# Phrases that mean the agent is wrapping up → trigger auto-hangup after playback.
 TERMINAL_PHRASES = {
     "you're welcome", "have a great day", "take care", "goodbye", "see you", "thanks for calling", "have a nice day",
 }
@@ -87,6 +96,8 @@ _SCHEDULING_KEYWORDS = {"schedule", "book", "appointment", "slot", "time", "morn
 
 
 def _pick_filler(user_text: str) -> Optional[str]:
+    """Choose a context-matched filler category, or None to skip it.
+    Short/greeting/acknowledgment utterances get no filler (reply is fast anyway)."""
     text = user_text.lower().strip().rstrip(".!?")
     if len(text.split()) <= 3 or text in _SKIP_KEYWORDS:
         return None
@@ -107,6 +118,7 @@ _tts_client: Optional[httpx.AsyncClient] = None
 
 
 def _get_claude():
+    """Lazily create the shared async Anthropic client (reused across all turns)."""
     global _claude_client
     if _claude_client is None:
         _claude_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
@@ -114,6 +126,7 @@ def _get_claude():
 
 
 def _get_tts_client():
+    """Lazily create the shared httpx client (persistent connections for TTS/SQL/Twilio)."""
     global _tts_client
     if _tts_client is None:
         _tts_client = httpx.AsyncClient(timeout=10.0)
@@ -153,9 +166,10 @@ async def deepgram_tts_mp3(text: str) -> bytes:
     return resp.content
 
 
-# ── Startup: pre-cache greeting audio ──
+# ── Startup / shutdown ──
 @app.on_event("startup")
 async def warm_cache():
+    """Pre-generate greeting + filler audio at boot so they play with zero latency."""
     global _greeting_audio_cache
     if not DEEPGRAM_API_KEY:
         logger.error("DEEPGRAM_API_KEY not set")
@@ -195,13 +209,15 @@ async def cleanup():
         await _tts_client.aclose()
 
 
-# ── Helpers ──
+# ── Audio helpers (Twilio Media Stream framing) ──
 def _is_terminal(text: str) -> bool:
+    """True if the agent's reply is a goodbye/wrap-up → triggers auto-hangup."""
     text_lower = text.lower()
     return any(phrase in text_lower for phrase in TERMINAL_PHRASES)
 
 
 def _audio_to_frames(stream_sid: str, audio: bytes, chunk_size: int = 640) -> list[str]:
+    """Split raw mulaw audio into base64 Twilio media frames (640 bytes ≈ 80ms)."""
     frames = []
     for i in range(0, len(audio), chunk_size):
         chunk = audio[i : i + chunk_size]
@@ -214,6 +230,8 @@ def _audio_to_frames(stream_sid: str, audio: bytes, chunk_size: int = 640) -> li
 
 
 async def send_audio(ws: WebSocket, stream_sid: str, audio: bytes, mark: Optional[str] = None):
+    """Stream mulaw audio to the caller; optionally append a named mark event
+    (Twilio echoes the mark back when this audio finishes playing)."""
     for frame in _audio_to_frames(stream_sid, audio):
         await ws.send_text(frame)
     if mark:
@@ -225,6 +243,7 @@ async def send_audio(ws: WebSocket, stream_sid: str, audio: bytes, mark: Optiona
 
 
 async def clear_audio(ws: WebSocket, stream_sid: str):
+    """Flush any audio Twilio has buffered (used to cut the filler before the real reply)."""
     await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
 
@@ -487,8 +506,10 @@ async def stream_claude_and_speak(
     return full_reply
 
 
-# ── Deepgram STT via raw WebSocket (additional_headers for auth) ──
+# ── Deepgram STT via raw WebSocket ──
 async def _connect_deepgram_stt():
+    """Open a Deepgram live-transcription socket. Auth MUST go in additional_headers
+    (subprotocols auth causes an immediate disconnect)."""
     url = (
         "wss://api.deepgram.com/v1/listen?"
         "model=nova-2&language=en-US&encoding=mulaw&sample_rate=8000"
@@ -501,9 +522,11 @@ async def _connect_deepgram_stt():
     return ws
 
 
-# ── WebSocket handler ──
+# ── Main WebSocket handler: the live AI phone conversation ──
 @app.websocket("/ws/voice-agent")
 async def voice_agent(ws: WebSocket):
+    """Drive one AI call: greet → STT → Claude → TTS per turn, auto-hangup on
+    goodbye, then write the transcript + summary to the audit table on exit."""
     await ws.accept()
 
     call_sid: Optional[str] = None
@@ -711,11 +734,13 @@ _SLOT_MAP = {
 
 
 def _twiml(xml_body: str) -> Response:
+    """Wrap a TwiML body in an XML response for Twilio."""
     return Response(content=f'<?xml version="1.0" encoding="UTF-8"?>{xml_body}', media_type="text/xml")
 
 
 @app.post("/call-gather")
 async def call_gather(request: Request):
+    """Main menu handler: 1 = schedule via DTMF, 2 = connect to the AI agent, else end."""
     form = await request.form()
     digits = form.get("Digits", "")
     call_sid = form.get("CallSid", "")
@@ -771,6 +796,7 @@ async def call_gather(request: Request):
 
 @app.post("/call-slot")
 async def call_slot(request: Request):
+    """Time-slot handler (after pressing 1): confirms the chosen slot or a callback."""
     form = await request.form()
     digits = form.get("Digits", "")
     call_sid = form.get("CallSid", "")
